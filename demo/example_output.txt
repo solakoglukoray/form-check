@@ -1,0 +1,47 @@
+$ form-check analyze squat_demo.mp4 --exercise squat --output ./frames
+
+Analyzing squat form...
+Video: squat_demo.mp4
+
++-----------------------------------+
+|          SQUAT RESULT             |
+|  Form Score: 76/100 - Needs Work  |
++-----------------------------------+
+
+Average Joint Angles
+ Joint    Avg Angle
+ Knee     112.4 deg
+ Hip       72.1 deg
+ Back      38.6 deg
+
+Feedback:
+  + Hip angle at bottom: Good (72.1 deg)
+  + Back lean (deg from vertical): Good (38.6 deg)
+  ! Knee angle at bottom: Too high (112.4 deg, target 70-120) -- close to limit
+
+Frames analyzed: 63 | Min: 58 | Max: 100
+Saved 63 annotated frames -> ./frames
+
+--- Deadlift example ---
+
+$ form-check analyze deadlift.mp4 --exercise deadlift
+
+Analyzing deadlift form...
+
++----------------------------------+
+|         DEADLIFT RESULT          |
+|  Form Score: 91/100 - Excellent  |
++----------------------------------+
+
+Average Joint Angles
+ Joint    Avg Angle
+ Hip       48.3 deg
+ Knee     107.8 deg
+ Back      42.1 deg
+
+Feedback:
+  + Hip hinge angle: Good (48.3 deg)
+  + Knee bend angle: Good (107.8 deg)
+  + Back angle from vertical: Good (42.1 deg)
+
+Frames analyzed: 41 | Min: 82 | Max: 100
