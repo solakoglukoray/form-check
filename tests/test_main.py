@@ -1,4 +1,4 @@
-"""Tests for form_check — angle math, benchmark scoring, and video pipeline."""
+"""Tests for form_check — angle math, benchmark scoring, rep detection, orientation."""
 
 import math
 from unittest.mock import MagicMock, patch
@@ -6,10 +6,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from form_check.benchmarks import BENCHMARKS, score_angles
-from form_check.poses import (  # noqa: E402
+from form_check.main import find_rep_peaks
+from form_check.poses import (
+    KEY_JOINT,
     Landmark,
     angle_from_vertical,
     calculate_angle,
+    check_orientation,
 )
 
 # ---------------------------------------------------------------------------
@@ -32,7 +35,6 @@ def test_calculate_angle_straight_line():
 
 
 def test_calculate_angle_60_degrees():
-    # Equilateral triangle — all angles 60 deg
     a = Landmark(0.0, 0.0)
     b = Landmark(1.0, 0.0)
     c = Landmark(0.5, math.sqrt(3) / 2)
@@ -41,7 +43,7 @@ def test_calculate_angle_60_degrees():
 
 def test_calculate_angle_zero_magnitude_returns_zero():
     a = Landmark(0.0, 0.0)
-    b = Landmark(0.0, 0.0)  # same as a -> zero vector
+    b = Landmark(0.0, 0.0)
     c = Landmark(1.0, 0.0)
     assert calculate_angle(a, b, c) == 0.0
 
@@ -111,9 +113,125 @@ def test_all_exercises_defined_in_benchmarks():
 
 
 def test_score_partial_angles_still_scores():
-    # Only knee provided — should still return a score based on that joint
     result = score_angles({"knee": 90.0}, "squat")
     assert result["score"] == 100
+
+
+# ---------------------------------------------------------------------------
+# find_rep_peaks — rep bottom detection
+# ---------------------------------------------------------------------------
+
+
+def test_find_rep_peaks_single_rep():
+    # One clear dip in the middle
+    angles = [170.0, 150.0, 90.0, 150.0, 170.0]
+    peaks = find_rep_peaks(angles)
+    assert peaks == [2]
+
+
+def test_find_rep_peaks_three_reps():
+    # Three dips separated by standing positions; min_distance=2 matches spacing
+    angles = [170.0, 90.0, 170.0, 88.0, 170.0, 92.0, 170.0]
+    peaks = find_rep_peaks(angles, min_distance=2)
+    assert len(peaks) == 3
+    assert 1 in peaks and 3 in peaks and 5 in peaks
+
+
+def test_find_rep_peaks_too_short_returns_all():
+    # Series with fewer than 3 points → return all indices
+    assert find_rep_peaks([90.0]) == [0]
+    assert find_rep_peaks([90.0, 100.0]) == [0, 1]
+
+
+def test_find_rep_peaks_flat_series_returns_empty():
+    # Flat line has no local minimum
+    angles = [170.0, 170.0, 170.0, 170.0]
+    peaks = find_rep_peaks(angles)
+    assert peaks == []
+
+
+def test_find_rep_peaks_min_distance_enforced():
+    # Two close minima — only the first should survive with min_distance=3
+    angles = [170.0, 90.0, 88.0, 170.0]
+    peaks = find_rep_peaks(angles, min_distance=3)
+    # idx 1 and 2 are both minima but only 1 frame apart; 1 is detected first
+    assert len(peaks) == 1
+
+
+# ---------------------------------------------------------------------------
+# check_orientation — camera angle detection
+# ---------------------------------------------------------------------------
+
+
+class _LM:
+    """Minimal landmark stub for orientation tests."""
+
+    def __init__(self, x: float, y: float, visibility: float = 1.0):
+        self.x = x
+        self.y = y
+        self.visibility = visibility
+
+
+def _make_landmarks(overrides: dict[int, _LM] | None = None) -> list[_LM]:
+    """Build a 33-landmark list with sensible side-view defaults."""
+    # Default: plausible side-view positions, all fully visible
+    defaults = {i: _LM(0.5, 0.5) for i in range(33)}
+    # MediaPipe indices: shoulders 11/12, hips 23/24, knees 25/26
+    defaults[11] = _LM(0.3, 0.3)   # left shoulder
+    defaults[12] = _LM(0.7, 0.3)   # right shoulder (far away x → side view)
+    defaults[23] = _LM(0.3, 0.6)   # left hip
+    defaults[24] = _LM(0.7, 0.6)   # right hip (far away x)
+    defaults[25] = _LM(0.3, 0.8)   # left knee
+    defaults[26] = _LM(0.7, 0.8)   # right knee
+    if overrides:
+        defaults.update(overrides)
+    return [defaults[i] for i in range(33)]
+
+
+def test_check_orientation_clean_side_view():
+    lms = _make_landmarks()
+    warnings = check_orientation(lms, "squat")
+    assert warnings == []
+
+
+def test_check_orientation_low_visibility_warns():
+    # All key joints barely visible
+    overrides = {
+        23: _LM(0.3, 0.6, visibility=0.2),
+        24: _LM(0.7, 0.6, visibility=0.2),
+        25: _LM(0.3, 0.8, visibility=0.2),
+        26: _LM(0.7, 0.8, visibility=0.2),
+    }
+    lms = _make_landmarks(overrides)
+    warnings = check_orientation(lms, "squat")
+    assert any("visibility" in w.lower() for w in warnings)
+
+
+def test_check_orientation_front_facing_warns():
+    # Both hips at nearly the same x coordinate → front-facing camera
+    overrides = {
+        23: _LM(0.49, 0.6),  # left hip
+        24: _LM(0.51, 0.6),  # right hip — only 0.02 apart
+    }
+    lms = _make_landmarks(overrides)
+    warnings = check_orientation(lms, "squat")
+    assert any("front" in w.lower() for w in warnings)
+
+
+def test_check_orientation_pushup_no_front_check():
+    # Front-facing detection only applies to squat/deadlift
+    overrides = {
+        23: _LM(0.49, 0.6),
+        24: _LM(0.51, 0.6),
+    }
+    lms = _make_landmarks(overrides)
+    warnings = check_orientation(lms, "pushup")
+    assert not any("front" in w.lower() for w in warnings)
+
+
+def test_key_joint_defined_for_all_exercises():
+    for exercise in ("squat", "deadlift", "pushup"):
+        assert exercise in KEY_JOINT
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +245,6 @@ def test_analyze_video_no_pose_returns_zero(mock_mp, mock_cv2):
     """When pose detection yields no landmarks, returns zero-score result."""
     mock_cap = MagicMock()
     mock_cv2.VideoCapture.return_value = mock_cap
-    # isOpened: True (initial check), True (while iteration), False (exit loop)
     mock_cap.isOpened.side_effect = [True, True, False]
     mock_cap.read.return_value = (True, MagicMock())
     mock_cv2.cvtColor.return_value = MagicMock()
@@ -145,4 +262,5 @@ def test_analyze_video_no_pose_returns_zero(mock_mp, mock_cv2):
     result = analyze_video("dummy.mp4", "squat")
     assert result["avg_score"] == 0
     assert result["frames_analyzed"] == 0
+    assert result["rep_count"] == 0
     assert len(result["feedback"]) > 0

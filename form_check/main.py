@@ -10,15 +10,45 @@ import mediapipe as mp
 import numpy as np
 
 from form_check.benchmarks import score_angles
-from form_check.poses import extract_angles
+from form_check.poses import KEY_JOINT, check_orientation, extract_angles
+
+
+def find_rep_peaks(angle_series: list[float], min_distance: int = 3) -> list[int]:
+    """
+    Find indices of rep bottom positions in an angle time-series.
+
+    The bottom of a rep (squat, deadlift, push-up) corresponds to a local
+    minimum in the key joint angle — the joint is most bent at that moment.
+
+    Args:
+        angle_series: Key joint angle measured at each sampled frame.
+        min_distance: Minimum number of frames between two detected peaks.
+
+    Returns:
+        List of indices into angle_series (may be empty for very short series).
+    """
+    if len(angle_series) < 3:
+        return list(range(len(angle_series)))
+
+    peaks: list[int] = []
+    for i in range(1, len(angle_series) - 1):
+        is_min = (
+            angle_series[i] < angle_series[i - 1]
+            and angle_series[i] < angle_series[i + 1]
+        )
+        if is_min and (not peaks or i - peaks[-1] >= min_distance):
+            peaks.append(i)
+
+    return peaks
 
 
 def _draw_overlay(
     frame: np.ndarray,
     angles: dict[str, float],
     score: int,
+    rep_num: Optional[int] = None,
 ) -> np.ndarray:
-    """Render angle values and form score onto a video frame."""
+    """Render joint angles, rep number, and form score onto a video frame."""
     overlay = frame.copy()
     if score >= 70:
         color = (0, 200, 0)
@@ -26,26 +56,16 @@ def _draw_overlay(
         color = (0, 140, 255)
     else:
         color = (0, 0, 220)
+
+    label = f"Rep {rep_num} — Score: {score}/100" if rep_num else f"Score: {score}/100"
     cv2.putText(
-        overlay,
-        f"Form Score: {score}/100",
-        (10, 35),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        1.0,
-        color,
-        2,
-        cv2.LINE_AA,
+        overlay, label, (10, 35),
+        cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2, cv2.LINE_AA,
     )
     for idx, (joint, angle) in enumerate(angles.items()):
         cv2.putText(
-            overlay,
-            f"{joint}: {angle:.1f} deg",
-            (10, 70 + idx * 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
+            overlay, f"{joint}: {angle:.1f} deg", (10, 70 + idx * 30),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA,
         )
     return overlay
 
@@ -57,17 +77,17 @@ def analyze_video(
     sample_rate: int = 10,
 ) -> dict:
     """
-    Analyze a workout video and return form scores and joint angles.
+    Analyze a workout video and return per-rep form scores.
 
-    Args:
-        video_path: Path to the input video file.
-        exercise: Exercise type: "squat", "deadlift", or "pushup".
-        output_dir: Directory to write annotated JPEG frames. None = skip.
-        sample_rate: Analyze every Nth frame (default 10).
+    Strategy:
+    1. Sample every Nth frame and extract joint angles.
+    2. Detect rep bottom positions via local minima in the key joint angle.
+    3. Score only those peak frames (not the entire movement average).
+    4. Fallback: if no reps are detected, score the bottom-quartile frames.
 
-    Returns:
-        Dict with keys: avg_score, min_score, max_score, frames_analyzed,
-        avg_angles, feedback, annotated_frames.
+    Returns dict with keys:
+        avg_score, rep_count, rep_scores, frames_analyzed,
+        avg_angles, feedback, annotated_frames, orientation_warnings.
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -76,11 +96,9 @@ def analyze_video(
     if output_dir:
         Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-    scores: list[int] = []
-    all_angles: dict[str, list[float]] = {}
-    annotated_frames: list[str] = []
+    frame_data: list[dict] = []
+    orientation_warnings: list[str] = []
     frame_idx = 0
-    analyzed = 0
 
     mp_pose = mp.solutions.pose
     mp_drawing = mp.solutions.drawing_utils
@@ -106,52 +124,87 @@ def analyze_video(
             if not results.pose_landmarks:
                 continue
 
+            # Check orientation once on the first detected frame.
+            if not frame_data and not orientation_warnings:
+                orientation_warnings = check_orientation(
+                    results.pose_landmarks.landmark, exercise
+                )
+
             try:
                 angles = extract_angles(results.pose_landmarks.landmark, exercise)
             except (IndexError, ZeroDivisionError, AttributeError):
                 continue
 
-            result = score_angles(angles, exercise)
-            scores.append(result["score"])
-
-            for joint, angle in angles.items():
-                all_angles.setdefault(joint, []).append(angle)
-
-            if output_dir:
-                annotated = _draw_overlay(frame, angles, result["score"])
-                mp_drawing.draw_landmarks(
-                    annotated,
-                    results.pose_landmarks,
-                    mp_pose.POSE_CONNECTIONS,
-                )
-                frame_path = str(Path(output_dir) / f"frame_{analyzed:04d}.jpg")
-                cv2.imwrite(frame_path, annotated)
-                annotated_frames.append(frame_path)
-
-            analyzed += 1
+            frame_data.append({
+                "angles": angles,
+                "landmarks": results.pose_landmarks,
+                "bgr": frame.copy() if output_dir else None,
+            })
 
     cap.release()
 
-    if not scores:
+    if not frame_data:
         return {
             "avg_score": 0,
-            "min_score": 0,
-            "max_score": 0,
+            "rep_count": 0,
+            "rep_scores": [],
             "frames_analyzed": 0,
             "avg_angles": {},
             "feedback": ["No pose detected — ensure full body is visible in frame."],
             "annotated_frames": [],
+            "orientation_warnings": orientation_warnings,
         }
 
-    avg_angles = {joint: sum(vals) / len(vals) for joint, vals in all_angles.items()}
+    # --- Rep detection -------------------------------------------------------
+    key_joint = KEY_JOINT[exercise]
+    key_angles = [fd["angles"].get(key_joint, 180.0) for fd in frame_data]
+    peak_indices = find_rep_peaks(key_angles)
+
+    # Fallback: no distinct reps found → use bottom-quartile frames.
+    if not peak_indices:
+        sorted_by_angle = sorted(range(len(key_angles)), key=lambda i: key_angles[i])
+        peak_indices = sorted_by_angle[: max(1, len(sorted_by_angle) // 4)]
+        peak_indices.sort()  # keep chronological order
+
+    # --- Score peak frames ---------------------------------------------------
+    rep_scores: list[int] = []
+    peak_angles_list: list[dict[str, float]] = []
+
+    for idx in peak_indices:
+        result = score_angles(frame_data[idx]["angles"], exercise)
+        rep_scores.append(result["score"])
+        peak_angles_list.append(frame_data[idx]["angles"])
+
+    # --- Annotated frame export (one image per rep) --------------------------
+    annotated_frames: list[str] = []
+    if output_dir:
+        for rep_num, data_idx in enumerate(peak_indices, start=1):
+            fd = frame_data[data_idx]
+            result = score_angles(fd["angles"], exercise)
+            annotated = _draw_overlay(fd["bgr"], fd["angles"], result["score"], rep_num)
+            mp_drawing.draw_landmarks(
+                annotated, fd["landmarks"], mp_pose.POSE_CONNECTIONS,
+            )
+            frame_path = str(Path(output_dir) / f"rep_{rep_num:02d}.jpg")
+            cv2.imwrite(frame_path, annotated)
+            annotated_frames.append(frame_path)
+
+    # --- Aggregate over peak frames only -------------------------------------
+    merged: dict[str, list[float]] = {}
+    for angles in peak_angles_list:
+        for joint, angle in angles.items():
+            merged.setdefault(joint, []).append(angle)
+    avg_angles = {joint: sum(vals) / len(vals) for joint, vals in merged.items()}
+
     summary = score_angles(avg_angles, exercise)
 
     return {
-        "avg_score": int(sum(scores) / len(scores)),
-        "min_score": min(scores),
-        "max_score": max(scores),
-        "frames_analyzed": analyzed,
+        "avg_score": int(sum(rep_scores) / len(rep_scores)),
+        "rep_count": len(peak_indices),
+        "rep_scores": rep_scores,
+        "frames_analyzed": len(frame_data),
         "avg_angles": avg_angles,
         "feedback": summary["feedback"],
         "annotated_frames": annotated_frames,
+        "orientation_warnings": orientation_warnings,
     }
