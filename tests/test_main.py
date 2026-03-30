@@ -207,15 +207,16 @@ def test_check_orientation_low_visibility_warns():
     assert any("visibility" in w.lower() for w in warnings)
 
 
-def test_check_orientation_front_facing_warns():
-    # Both hips at nearly the same x coordinate → front-facing camera
+def test_check_orientation_front_facing_no_longer_warns():
+    # With 3D angle math the front-facing check is removed — z compensates.
+    # A front-facing camera should NOT trigger a warning anymore.
     overrides = {
         23: _LM(0.49, 0.6),  # left hip
-        24: _LM(0.51, 0.6),  # right hip — only 0.02 apart
+        24: _LM(0.51, 0.6),  # right hip — nearly same x (would look front-facing)
     }
     lms = _make_landmarks(overrides)
     warnings = check_orientation(lms, "squat")
-    assert any("front" in w.lower() for w in warnings)
+    assert not any("front" in w.lower() for w in warnings)
 
 
 def test_check_orientation_pushup_no_front_check():
