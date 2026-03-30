@@ -40,29 +40,49 @@ def _draw_skeleton(
         cv2.circle(frame, pt, 4, (0, 0, 255), -1, cv2.LINE_AA)
 
 
-def find_rep_peaks(angle_series: list[float], min_distance: int = 3) -> list[int]:
-    """
-    Find indices of rep bottom positions in an angle time-series.
+# Minimum angle drop required to count as a genuine rep bottom.
+# Values above this threshold are "standing" positions — noise, not reps.
+_REP_DEPTH_THRESHOLD: dict[str, float] = {
+    "squat": 140.0,    # knee must be < 140° (at least some meaningful bend)
+    "deadlift": 120.0, # hip must be < 120°
+    "pushup": 140.0,   # elbow must be < 140°
+}
 
-    The bottom of a rep corresponds to a local minimum in the key joint angle.
+
+def find_rep_peaks(
+    angle_series: list[float],
+    exercise: str = "squat",
+    min_distance: int = 3,
+) -> list[int]:
+    """
+    Find indices of genuine rep bottom positions in an angle time-series.
+
+    Two criteria must both be met for a frame to count as a rep bottom:
+    1. Local minimum — angle is lower than the frames before and after it.
+    2. Depth threshold — angle is below the exercise-specific minimum,
+       filtering out standing-position noise (small fluctuations near 170°
+       that look like local minima but are not actual reps).
 
     Args:
         angle_series: Key joint angle at each sampled frame.
+        exercise: Used to look up the depth threshold.
         min_distance: Minimum frames between two detected peaks.
 
     Returns:
-        List of indices (chronological order).
+        List of indices in chronological order.
     """
     if len(angle_series) < 3:
         return list(range(len(angle_series)))
 
+    threshold = _REP_DEPTH_THRESHOLD.get(exercise, 150.0)
     peaks: list[int] = []
     for i in range(1, len(angle_series) - 1):
         is_min = (
             angle_series[i] < angle_series[i - 1]
             and angle_series[i] < angle_series[i + 1]
         )
-        if is_min and (not peaks or i - peaks[-1] >= min_distance):
+        deep_enough = angle_series[i] < threshold
+        if is_min and deep_enough and (not peaks or i - peaks[-1] >= min_distance):
             peaks.append(i)
 
     return peaks
@@ -190,7 +210,7 @@ def analyze_video(
     # --- Rep detection -------------------------------------------------------
     key_joint = KEY_JOINT[exercise]
     key_angles = [fd["angles"].get(key_joint, 180.0) for fd in frame_data]
-    peak_indices = find_rep_peaks(key_angles)
+    peak_indices = find_rep_peaks(key_angles, exercise=exercise)
 
     if not peak_indices:
         sorted_by_angle = sorted(range(len(key_angles)), key=lambda i: key_angles[i])
