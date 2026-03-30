@@ -10,22 +10,48 @@ import mediapipe as mp
 import numpy as np
 
 from form_check.benchmarks import score_angles
+from form_check.models import get_model_path
 from form_check.poses import KEY_JOINT, check_orientation, extract_angles
+
+# MediaPipe Tasks API (v0.10+)
+_BaseOptions = mp.tasks.BaseOptions
+_PoseLandmarker = mp.tasks.vision.PoseLandmarker
+_PoseLandmarkerOptions = mp.tasks.vision.PoseLandmarkerOptions
+_RunningMode = mp.tasks.vision.RunningMode
+_PoseConnections = mp.tasks.vision.PoseLandmarksConnections.POSE_LANDMARKS
+
+
+def _draw_skeleton(
+    frame: np.ndarray,
+    landmarks: list,
+    connections: list,
+) -> None:
+    """Draw pose skeleton onto frame in-place using OpenCV."""
+    h, w = frame.shape[:2]
+    pts = {
+        i: (int(lm.x * w), int(lm.y * h))
+        for i, lm in enumerate(landmarks)
+    }
+    for conn in connections:
+        a, b = conn.start, conn.end
+        if a in pts and b in pts:
+            cv2.line(frame, pts[a], pts[b], (224, 224, 224), 2, cv2.LINE_AA)
+    for pt in pts.values():
+        cv2.circle(frame, pt, 4, (0, 0, 255), -1, cv2.LINE_AA)
 
 
 def find_rep_peaks(angle_series: list[float], min_distance: int = 3) -> list[int]:
     """
     Find indices of rep bottom positions in an angle time-series.
 
-    The bottom of a rep (squat, deadlift, push-up) corresponds to a local
-    minimum in the key joint angle — the joint is most bent at that moment.
+    The bottom of a rep corresponds to a local minimum in the key joint angle.
 
     Args:
-        angle_series: Key joint angle measured at each sampled frame.
-        min_distance: Minimum number of frames between two detected peaks.
+        angle_series: Key joint angle at each sampled frame.
+        min_distance: Minimum frames between two detected peaks.
 
     Returns:
-        List of indices into angle_series (may be empty for very short series).
+        List of indices (chronological order).
     """
     if len(angle_series) < 3:
         return list(range(len(angle_series)))
@@ -57,7 +83,7 @@ def _draw_overlay(
     else:
         color = (0, 0, 220)
 
-    label = f"Rep {rep_num} — Score: {score}/100" if rep_num else f"Score: {score}/100"
+    label = f"Rep {rep_num} - Score: {score}/100" if rep_num else f"Score: {score}/100"
     cv2.putText(
         overlay, label, (10, 35),
         cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2, cv2.LINE_AA,
@@ -80,10 +106,10 @@ def analyze_video(
     Analyze a workout video and return per-rep form scores.
 
     Strategy:
-    1. Sample every Nth frame and extract joint angles.
+    1. Sample every Nth frame and extract joint angles via MediaPipe Tasks API.
     2. Detect rep bottom positions via local minima in the key joint angle.
-    3. Score only those peak frames (not the entire movement average).
-    4. Fallback: if no reps are detected, score the bottom-quartile frames.
+    3. Score only the peak (deepest) frame of each rep.
+    4. Fallback: if no reps detected, score bottom-quartile frames.
 
     Returns dict with keys:
         avg_score, rep_count, rep_scores, frames_analyzed,
@@ -93,6 +119,8 @@ def analyze_video(
     if not cap.isOpened():
         raise FileNotFoundError(f"Cannot open video file: {video_path!r}")
 
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+
     if output_dir:
         Path(output_dir).mkdir(parents=True, exist_ok=True)
 
@@ -100,15 +128,16 @@ def analyze_video(
     orientation_warnings: list[str] = []
     frame_idx = 0
 
-    mp_pose = mp.solutions.pose
-    mp_drawing = mp.solutions.drawing_utils
-
-    with mp_pose.Pose(
-        static_image_mode=False,
-        model_complexity=1,
-        min_detection_confidence=0.5,
+    options = _PoseLandmarkerOptions(
+        base_options=_BaseOptions(model_asset_path=get_model_path()),
+        running_mode=_RunningMode.VIDEO,
+        num_poses=1,
+        min_pose_detection_confidence=0.5,
+        min_pose_presence_confidence=0.5,
         min_tracking_confidence=0.5,
-    ) as pose:
+    )
+
+    with _PoseLandmarker.create_from_options(options) as landmarker:
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
@@ -119,25 +148,26 @@ def analyze_video(
                 continue
 
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = pose.process(rgb)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            timestamp_ms = int((frame_idx / fps) * 1000)
+            results = landmarker.detect_for_video(mp_image, timestamp_ms)
 
             if not results.pose_landmarks:
                 continue
 
-            # Check orientation once on the first detected frame.
+            landmarks = results.pose_landmarks[0]
+
             if not frame_data and not orientation_warnings:
-                orientation_warnings = check_orientation(
-                    results.pose_landmarks.landmark, exercise
-                )
+                orientation_warnings = check_orientation(landmarks, exercise)
 
             try:
-                angles = extract_angles(results.pose_landmarks.landmark, exercise)
+                angles = extract_angles(landmarks, exercise)
             except (IndexError, ZeroDivisionError, AttributeError):
                 continue
 
             frame_data.append({
                 "angles": angles,
-                "landmarks": results.pose_landmarks,
+                "landmarks": landmarks,
                 "bgr": frame.copy() if output_dir else None,
             })
 
@@ -150,7 +180,9 @@ def analyze_video(
             "rep_scores": [],
             "frames_analyzed": 0,
             "avg_angles": {},
-            "feedback": ["No pose detected — ensure full body is visible in frame."],
+            "feedback": [
+                "No pose detected — ensure full body is visible in frame."
+            ],
             "annotated_frames": [],
             "orientation_warnings": orientation_warnings,
         }
@@ -160,11 +192,10 @@ def analyze_video(
     key_angles = [fd["angles"].get(key_joint, 180.0) for fd in frame_data]
     peak_indices = find_rep_peaks(key_angles)
 
-    # Fallback: no distinct reps found → use bottom-quartile frames.
     if not peak_indices:
         sorted_by_angle = sorted(range(len(key_angles)), key=lambda i: key_angles[i])
         peak_indices = sorted_by_angle[: max(1, len(sorted_by_angle) // 4)]
-        peak_indices.sort()  # keep chronological order
+        peak_indices.sort()
 
     # --- Score peak frames ---------------------------------------------------
     rep_scores: list[int] = []
@@ -182,14 +213,12 @@ def analyze_video(
             fd = frame_data[data_idx]
             result = score_angles(fd["angles"], exercise)
             annotated = _draw_overlay(fd["bgr"], fd["angles"], result["score"], rep_num)
-            mp_drawing.draw_landmarks(
-                annotated, fd["landmarks"], mp_pose.POSE_CONNECTIONS,
-            )
+            _draw_skeleton(annotated, fd["landmarks"], _PoseConnections)
             frame_path = str(Path(output_dir) / f"rep_{rep_num:02d}.jpg")
             cv2.imwrite(frame_path, annotated)
             annotated_frames.append(frame_path)
 
-    # --- Aggregate over peak frames only -------------------------------------
+    # --- Aggregate over peak frames ------------------------------------------
     merged: dict[str, list[float]] = {}
     for angles in peak_angles_list:
         for joint, angle in angles.items():

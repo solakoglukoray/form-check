@@ -4,7 +4,6 @@ import math
 from typing import NamedTuple
 
 # The joint whose angle is used to detect rep bottom positions (local minima).
-# At the deepest point of each rep, this angle is at its smallest value.
 KEY_JOINT: dict[str, str] = {
     "squat": "knee",
     "deadlift": "hip",
@@ -44,11 +43,6 @@ def check_orientation(landmarks: list, exercise: str) -> list[str]:
     """
     Inspect landmark visibility to detect camera angle problems.
 
-    Checks two things:
-    - Overall visibility: are key joints clearly detected?
-    - Front-facing detection: squat/deadlift require a side view; if both hips
-      have nearly the same x coordinate the camera is likely facing front.
-
     Returns a list of warning strings (empty = no issues detected).
     """
     LEFT_SHOULDER, RIGHT_SHOULDER = 11, 12
@@ -62,9 +56,7 @@ def check_orientation(landmarks: list, exercise: str) -> list[str]:
     else:
         vis_indices = [LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_HIP, RIGHT_HIP]
 
-    vis_scores = [
-        getattr(landmarks[i], "visibility", 1.0) for i in vis_indices
-    ]
+    vis_scores = [getattr(landmarks[i], "visibility", 1.0) for i in vis_indices]
     avg_vis = sum(vis_scores) / len(vis_scores)
 
     if avg_vis < 0.5:
@@ -73,13 +65,8 @@ def check_orientation(landmarks: list, exercise: str) -> list[str]:
             "ensure full body is visible in frame."
         )
 
-    # Front-facing detection for lower-body exercises.
-    # In a true side view one hip occludes the other (large x difference).
-    # When facing the camera, both hips sit at nearly the same x coordinate.
     if exercise in ("squat", "deadlift"):
-        left_hip = landmarks[LEFT_HIP]
-        right_hip = landmarks[RIGHT_HIP]
-        hip_x_diff = abs(left_hip.x - right_hip.x)
+        hip_x_diff = abs(landmarks[LEFT_HIP].x - landmarks[RIGHT_HIP].x)
         if hip_x_diff < 0.08:
             warnings.append(
                 "Camera appears front-facing — rotate 90 degrees to a side view "
@@ -94,7 +81,7 @@ def extract_angles(landmarks: list, exercise: str) -> dict[str, float]:
     Extract relevant joint angles from MediaPipe pose landmarks.
 
     Args:
-        landmarks: MediaPipe pose_landmarks.landmark list (33 points).
+        landmarks: NormalizedLandmark list (33 points, x/y in [0,1]).
         exercise: One of "squat", "deadlift", "pushup".
 
     Returns:
